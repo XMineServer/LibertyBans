@@ -31,6 +31,7 @@ module space.arim.libertybans.core {
 	requires static org.checkerframework.checker.qual;
 	requires org.jooq;
 	requires org.slf4j;
+	requires org.yaml.snakeyaml;
 	requires space.arim.api.env;
 	requires transitive space.arim.api.jsonchat;
 	requires space.arim.api.util.dazzleconf;
