@@ -866,6 +866,12 @@
 			<groupId>space.arim.injector</groupId>
 			<artifactId>injector</artifactId>
 		</dependency>
+		<!--
+		  Brings SnakeYAML with it, which EnvironmentScalarConstructor uses directly. SnakeYAML is
+		  deliberately NOT declared here as well: this module's dependencyManagement pins 1.26, and
+		  declaring it would force that version into the Fabric module's Gradle resolution, which
+		  settles on 1.33 and verifies every artifact against gradle/verification-metadata.xml.
+		-->
 		<dependency>
 			<groupId>space.arim.dazzleconf</groupId>
 			<artifactId>dazzleconf-ext-snakeyaml</artifactId>

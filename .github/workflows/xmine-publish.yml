@@ -1,0 +1,197 @@
+# Публикация нашей сборки LibertyBans в свой Reposilite.
+#
+# ЭТОТ РЕПОЗИТОРИЙ ПУБЛИЧНЫЙ (форк AGPL-проекта, и он обязан таким остаться),
+# поэтому `runs-on` здесь — только раннеры GitHub и никогда `self-hosted`.
+# Правило записано в вики (infra/ci.md, «Граница безопасности: только приватные
+# репозитории»), и обе группы раннеров организации держат
+# `allows_public_repositories=false` именно под него. Причина: PR из чужого форка
+# исполняет workflow ИЗ САМОГО PR, то есть автор форка волен дописать
+# `runs-on: self-hosted` и получить исполнение своего кода на хосте, где работает
+# игровой сервер.
+#
+# Отсюда же остальные меры: триггера `pull_request` нет вовсе, push ограничен
+# нашими ветками, а job не запускается в форках самого форка.
+#
+# Координата - адрес сборки в разделе-кандидате пары форков `fork-snapshot`
+# (вики, ADR-0056), как у HuskSync и Sonar. Публикуется любая ветка `xmine/**`,
+# но закрепляться в XMineNode и VelocityServer можно только на координату с
+# `xmine/main` (ADR-0060): в версии это `…-xmine-main-…`.
+
+name: XMine - publish LibertyBans
+
+on:
+  push:
+    branches: ['xmine/**']
+  workflow_dispatch:
+
+# Публикация не должна идти в два потока: параллельные сборки означали бы гонку
+# за то, чья попадёт под координату.
+concurrency:
+  group: xmine-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Апстримная версия - единственное, что здесь задаётся руками: из git её не
+  # вывести, она говорит, поверх какого релиза сделан форк. Меняется при
+  # перебазировании на новый апстрим, а не при каждой нашей правке.
+  #
+  # Остальное считает шаг «Версия» ниже: <апстрим>-<ветка>-<ГГГГ-ММ-ДД>-<хеш>.
+  #
+  # В pom версию не подставляем: у LibertyBans включена проверка доверенных
+  # контрольных сумм (`.mvn/maven.config`), которая для релизных версий требует
+  # записи на каждый артефакт, включая собственные модули, а файлы
+  # `.mvn/artifact-checksums/**` защищены отдельным workflow апстрима от
+  # изменения. Поэтому собираем как есть (`1.2.0-M1-SNAPSHOT`) и публикуем
+  # итоговый jar под своей координатой.
+  UPSTREAM_VERSION: "1.2.0-M1"
+  MAVEN_GROUP_PATH: ru/xmine/thirdparty
+  MAVEN_ARTIFACT: libertybans
+  # Раздел-кандидат пары форков, а не third-party: third-party - зеркало ЧУЖИХ
+  # артефактов, а сборку форка правим и собираем мы, поэтому у неё есть стадия.
+  # Раздел, как и third-party, закрыт авторизацией.
+  MAVEN_SECTION: fork-snapshot
+
+jobs:
+  publish:
+    # Форки самого форка не должны пытаться публиковать в наш Reposilite.
+    if: github.repository == 'XMineServer/LibertyBans'
+    runs-on: ubuntu-latest
+
+    env:
+      XMINE_MAVEN_USERNAME: ${{ secrets.XMINE_MAVEN_USERNAME }}
+      XMINE_MAVEN_PASSWORD: ${{ secrets.XMINE_MAVEN_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: 25
+          distribution: 'zulu'
+
+      - name: Версия
+        # Считается из коммита, а не берётся из константы: координата обязана
+        # различать сборки. `/` в имени ветки заменяется на `-` - в версии Maven
+        # это разделитель пути в раскладке репозитория, и артефакт уехал бы не туда.
+        run: |
+          set -eu
+          branch=$(printf '%s' "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9.' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+          read -r cdate chash < <(git log -1 --format='%cs %h')
+          echo "XMINE_VERSION=${UPSTREAM_VERSION}-${branch}-${cdate}-${chash}" >> "$GITHUB_ENV"
+
+      - name: Fail early without credentials
+        run: |
+          # Без учётки сборка дошла бы до конца и упала на последнем шаге. Сборка
+          # LibertyBans занимает минуты вместе с gradle-подпроектом Fabric, так
+          # что дешевле проверить сразу.
+          set -eu
+          if [ -z "${XMINE_MAVEN_USERNAME:-}" ] || [ -z "${XMINE_MAVEN_PASSWORD:-}" ]; then
+            echo "::error::Secrets XMINE_MAVEN_USERNAME / XMINE_MAVEN_PASSWORD are not set"
+            exit 1
+          fi
+
+      - name: Занята ли координата
+        id: exists
+        # Координата неизменяема, поэтому «уже опубликовано» - законный ответ, а не
+        # ошибка. Коды различаются намеренно: 404 - публиковать, 200 - пропустить,
+        # всё остальное - падать. 401 при неверном имени секрета иначе выглядел бы
+        # как «артефакта нет».
+        run: |
+          set -eu
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                   --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+                   "${BASE}/${MAVEN_ARTIFACT}-${XMINE_VERSION}.pom")
+          case "$CODE" in
+            404) echo "found=false" >> "$GITHUB_OUTPUT"; echo "Публикуем ${XMINE_VERSION}" ;;
+            200) echo "found=true"  >> "$GITHUB_OUTPUT"
+                 echo "${XMINE_VERSION} уже в разделе ${MAVEN_SECTION} - собирать нечего" ;;
+            *)   echo "::error::${BASE} ответил $CODE - это не «есть» и не «нет»"; exit 1 ;;
+          esac
+
+      - name: Test
+        if: steps.exists.outputs.found == 'false'
+        # Своя правка живёт целиком в bans-core (подстановка env в конфиги через
+        # тег !ENV), и её тесты — единственное, что отделяет сломанный плагин от
+        # публикации. Полный `verify` апстрима сюда не берём: он гоняет
+        # invoker-тесты и поднимает контейнеры БД, то есть стоит десятки минут
+        # ради того, что наша правка не трогает.
+        run: ./mvnw -B -pl bans-core -am test -Dsurefire.failIfNoSpecifiedTests=false
+
+      - name: Build
+        if: steps.exists.outputs.found == 'false'
+        # Профили — те же, что у апстримного deploy-job (.github/workflows/maven.yml):
+        # `build-snapshot` разрешает снапшотную версию, `-docker-enabled` снимает
+        # тесты, которым нужен docker, `invoker.skip` — интеграционные прогоны.
+        run: ./mvnw -B package -Pbuild-snapshot,skip-all-tests,-docker-enabled -DskipTests -Dinvoker.skip=true
+
+      - name: Publish to Reposilite
+        if: steps.exists.outputs.found == 'false'
+        run: |
+          set -eu
+          JAR="$(ls bans-distribution/executable/target/LibertyBans_*.jar)"
+          echo "Built: $JAR"
+
+          BASE="https://maven.xmine.world/${MAVEN_SECTION}/${MAVEN_GROUP_PATH}/${MAVEN_ARTIFACT}/${XMINE_VERSION}"
+          NAME="${MAVEN_ARTIFACT}-${XMINE_VERSION}"
+
+          # Минимальный pom рядом с jar. fetch.py забирает артефакт прямым
+          # адресом и pom не читает, но без него координата не является
+          # полноценной maven-координатой, и любой другой клиент об это спотыкается.
+          cat > "/tmp/${NAME}.pom" <<POM
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>$(echo "${MAVEN_GROUP_PATH}" | tr '/' '.')</groupId>
+            <artifactId>${MAVEN_ARTIFACT}</artifactId>
+            <version>${XMINE_VERSION}</version>
+            <packaging>jar</packaging>
+            <description>XMineServer build of LibertyBans (AGPL-3.0), fork of A248/LibertyBans. Source: https://github.com/XMineServer/LibertyBans, base commit: ${GITHUB_SHA}</description>
+          </project>
+          POM
+
+          for file in "$JAR:${NAME}.jar" "/tmp/${NAME}.pom:${NAME}.pom"; do
+            src="${file%%:*}"
+            dst="${file##*:}"
+            echo "Uploading $dst"
+            curl --fail-with-body --silent --show-error \
+                 --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+                 --upload-file "$src" "${BASE}/${dst}"
+            echo
+          done
+
+          # Обратная сверка: скачать опубликованное и сличить с локальным
+          # файлом. Без неё «опубликовано» означает только «сервер ответил 2xx».
+          LOCAL="$(sha256sum "$JAR" | cut -d' ' -f1)"
+          curl --fail-with-body --silent --show-error \
+               --user "${XMINE_MAVEN_USERNAME}:${XMINE_MAVEN_PASSWORD}" \
+               -o /tmp/roundtrip.jar "${BASE}/${NAME}.jar"
+          REMOTE="$(sha256sum /tmp/roundtrip.jar | cut -d' ' -f1)"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::Round-trip mismatch: local $LOCAL, published $REMOTE"
+            exit 1
+          fi
+
+          {
+            echo "### Published"
+            echo '```'
+            echo "$(echo "${MAVEN_GROUP_PATH}" | tr '/' '.'):${MAVEN_ARTIFACT}:${XMINE_VERSION}"
+            echo "repo:        ${MAVEN_SECTION}"
+            echo "sha256:      ${LOCAL}"
+            echo "base commit: ${GITHUB_SHA}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Уже опубликовано
+        if: steps.exists.outputs.found == 'true'
+        run: |
+          {
+            echo "### Ничего не публиковалось"
+            echo
+            echo "\`${XMINE_VERSION}\` уже лежит в разделе \`${MAVEN_SECTION}\`:"
+            echo "входы этой сборки с прошлой публикации не менялись."
+          } >> "$GITHUB_STEP_SUMMARY"
